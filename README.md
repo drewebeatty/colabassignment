@@ -1,2 +1,2 @@
-# colabassignment
-Joint assignment to use Colab notebook with a neural network. Data files are included as well as an RMarkdown file of the code, as some version conflicts between python and R tensorflow may not operate without significant time spent correcting the problem.
+# Colab + Git Assignment
+Joint assignment to use Colab notebook with a neural network. Data file is included, as well as an RMarkdown file of the code, as some version conflicts between Python and R tensorflow operating in Colab may not operate without significant time spent correcting the problem.
