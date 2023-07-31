@@ -1,0 +1,183 @@
+---
+title: "Alternative to Colab File"
+author: "Drew Beatty"
+date: "2023-07-31"
+output: 
+  html_document:
+    toc: true 
+    toc_depth: 4
+    toc_float: true
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+---
+# **Neural Network Model to Produce Predictions of Success in Residential Treatment**
+
+Welcome to markdown, where our objective is to build a neural network model capable of predicting whether an adolescent will successfully complete the program based on their demographic characteristics and initial score on the Youth Outcome Questionnaire (YOQ). The YOQ is a comprehensive 64-item self-report measure that assesses various aspects of psychological health.
+
+The successful development of this model can serve two valuable purposes. Firstly, it could facilitate predictions prior to clients' admission into the program, aiding in informed admissions decisions. Secondly, it may assist therapists and staff in adopting a more proactive approach to treatment.
+
+For our analysis using the R programming language, we will be utilizing publicly available and de-identified data from a long-term residential treatment center catering to adolescent girls with borderline tendencies. This dataset comprises demographic information, treatment-related variables, responses to all 64 YOQ questions, calculated scores for the six YOQ subscales, and an overall YOQ total score. Additionally, the dataset includes an outcome variable, denoting whether the adolescent successfully completed the program, in contrast to dropping out or being asked to leave.
+
+In regards to this assignment and code, this framework and work flow was learned from John Curtin's machine learning class. The workflow is taken from our unit on neural networks, however the code has been changed to accomodate data from my own research!
+
+
+### **Load the Required Packages**
+
+Now that we have all the packages installed, let's load them into our environment. We will also be using some functions that John Curtin wrote and has posted in to his github. We will be pulling down these functions from github using devtools. If this method doesn't work for you the functions can also be found in the file "fun_modeling.R" which is included in the repo.
+```{r setup}
+library(ggplot2)
+#source('fun_modeling.R')
+library(keras)
+library(tensorflow)
+library(psych) # for summary of data
+library(tidymodels) # for modeling
+library(tidyverse) # for general data wrangling
+library(kableExtra) # for displaying formatted tables w/ kbl()
+library(skimr) # for skim()
+library(corrplot)
+library(ggplot2)
+library(cowplot)
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true") # functions for plotting
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+theme_set(theme_half_open())
+```
+
+
+### **Load in the Data**
+The data file included in the repo is called "yoq_nn.csv". You will need to upload this folder to your working files to read it in.
+```{r}
+d <- read_csv('yoq_nn.csv') # read the file in
+describe(d) # get a quick look at our data set
+```
+
+
+### Split Data Into Training and Testing Sets
+
+We first need to split our full data into a training set for our model to learn from, and then a test set to evaluate our models performance in cases that it has not seen before.
+```{r}
+splits <- d %>%
+  initial_split(prop = 0.75, strata = "Completion") # splitting our data, stratifying the 0.75 (3/4) split on our outcome variable
+
+data_trn <- analysis(splits) # saving it into our training set
+data_trn %>%  nrow() # get count of training set rows, see if split seems right
+
+data_test <- assessment(splits) # saving it into our test set
+data_test %>% nrow() 
+```
+
+### Set Random Seed
+For reproducibility we will set a random seed. There are points in the fitting process of our neural network model where random numbers are needed by Keras, including when we initialize the weights for the hidden and output layers, selecting units for dropout, and when selecting batches within the epochs. Thankfully, tidymodels lets us provide three seeds to these points within the model reproducible.
+```{r}
+set.seed(12345) # random seed
+fit_seeds <- sample.int(10^5, size = 3) # we will be using a random seed within our model, so we are saving it here
+```
+
+
+### Setting Up K-Fold Splits
+We will be using k-fold cross-validation for our neural network. This is advantageous because we are dealing with a fairly small dataset. By using k-fold cross-validation we have better data utilization by dividing the dataset into k subsets ("or folds"). Each fold serves as a validation set in every iteration, while the remaining k-1 folds are used for training. This maximizes the use of our data, enhances the model's overall robustness, and reduces overfitting.
+
+K-fold cross-validation also provides more reliable performance estimation by averaging performance metrics over *k* iterations. This helps assess the model's consistency and generalization on unseen data, which could vary greatly with a small data set like ours. Additionally, the k-fold cross-validation allows for hyperparameter tuning, as it allows evaluating different parameter configurations across various k subsets. This ultimately leads to more informed hyperparameter selection, ensuring a more stable performing neural network model, even with our small data set!
+```{r}
+splits_kfold <- data_trn %>%
+  vfold_cv(v = 10, repeats = 1, strata = "Completion") # specifying that we want 10 folds stratified on our outcome variable "Completion" with just one repeat
+```
+
+
+### Setting Up a Recipe
+
+In the tidymodels framework, a "recipe" serves as a data preprocessing/feature engineering for transforming our raw data into a format that is suited for training and evaluating our neural network model. Normally, recipes facilitate steps like scaling, normalization, handling missing values, and handling categorical variables to produce consistent and sensical input for the model.
+
+Some models require extensive data pre-processing and feature engineering to optimize results, however the neurral network does pretty well "out of the box", and thus minimal processing and feature engineering is required.
+```{r}
+rec <-
+  recipe(Completion ~ ., data = data_trn) %>% # regressing all variables in the data onto our outcome
+  step_rm(CID) %>% # removing the id number since not meaningful
+  step_string2factor(Completion, levels = c("completion", "non_completion")) %>% # specifying the levels of our outcome variable and turning into a factor variable instead of string
+  step_YeoJohnson(all_numeric_predictors()) %>% # for normality, there is some extreme skew in some variabless
+  step_nzv(all_predictors()) %>% # removes variables that are very sparse and unbalanced (Near-Zero Variance), there are some variables like this in the dataset
+  step_impute_knn(all_numeric_predictors()) %>% # since there is missing data, we will use the knn method to impute the data
+  step_range(all_predictors()) # range correction for better model performance and convergence
+```
+
+
+### Make a Feature Matrix
+Now that we have a recipe, we will feed in our training data to make a feature matrix to use in our best model. We will also make a feature matrix right now for our test data, so we can see the accuracy of our model and visualise performance.
+```{r message=FALSE, warning=FALSE}
+feat_trn <- rec %>%
+  make_features(data_trn)
+
+feat_test <- rec %>%
+  make_features(data_trn, data_test)
+```
+
+### Hyper Parameter Tuning
+With the tidymodels framework we can tune our hyper parameters to find the optimal point. For our model, we are going to tune the amoung of hidden layers, and the amount of dropout.
+```{r}
+grid_keras <- expand_grid(hidden_units = c(5, 10, 20), dropout = c(.1, .001))
+```
+
+
+## Fit the Model
+We can now run our model! We will be using our grid to tune our hyperparameters.
+
+```{r}
+fits_nn <-
+  mlp(hidden_units = tune(), dropout = tune(), activation = "relu", epochs = 50) %>% 
+  set_mode("classification") %>% # setting the mode of the model to "classification" since we are solving a classification problem
+  set_engine("keras", verbose = 1, seeds = fit_seeds) %>%
+  tune_grid(preprocessor = rec,
+                grid = grid_keras,
+                resamples = splits_kfold,
+                metrics = metric_set(accuracy)) # 'metrics' sets the evaluation metrics, in this case, we are using accuracy as the performance metric, but can use others later
+```
+
+
+### Performance of Best Model in Train
+We can use show_best to see how our best model across the parameters performed.
+```{r}
+show_best(fits_nn)
+```
+
+### Fit the Best Model
+We can now fit our best model in training.
+```{r}
+fit_nn <- mlp(hidden_units = select_best(fits_nn)$hidden_units,dropout= select_best(fits_nn)$dropout, activation = "relu", epochs = 50) %>%
+    set_mode("classification") %>% 
+    set_engine("keras", verbose = 1, seeds = fit_seeds) %>%  fit(Completion ~ ., data = feat_trn)
+```
+
+### Accuracy in Test Data
+We can now see how our model performs in the test data. 
+```{r}
+accuracy_vec(truth = feat_test$Completion,
+             estimate = predict(fit_nn, feat_test)$.pred_class)
+```
+
+### Confusion Matrix 
+A confusion matrix can be used to understand how the model is performing, and where it may be lacking. We can put this confusion matrix into a heatmap style plot to get a quicker understanding of how the model is performing, For our heatmap we can see that the model is doing good(ish) at predicting true completion.
+```{r}
+cm <- tibble(truth = feat_test$Completion,
+                 estimate = predict(fit_nn, feat_test)$.pred_class) %>% 
+  conf_mat(truth, estimate)
+
+cm
+
+cm <- tibble(truth = feat_test$Completion,
+                 estimate = predict(fit_nn, feat_test)$.pred_class) %>% 
+  conf_mat(truth, estimate)
+
+autoplot(cm, type = 'heatmap')
+
+```
+
+### Other Estimates of Performance
+Earlier I mentioned that we can get estimates of our model other than accuracy. This is important because sometimes accuracy is not a good estimate of our models performance if we have a specific goal in mind of how we want to use the model. For example, our model has okay accuracy and sensitivity, but falls apart when it comes to specificity, which ultimately is not incredibly helpful when we want to use this model to intervene in cases where we think non-completion might happen.
+
+```{r}
+cm %>% 
+  summary() %>% 
+  filter(.metric %in% c("accuracy", "sens", "spec")) %>% 
+  dplyr::select(-.estimator)
+```
+
